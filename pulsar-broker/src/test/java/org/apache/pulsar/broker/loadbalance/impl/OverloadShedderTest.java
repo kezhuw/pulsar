@@ -106,6 +106,38 @@ public class OverloadShedderTest {
     }
 
     @Test
+    public void testPreserveAtLeastOneBundle() {
+        LoadData loadData = new LoadData();
+
+        LocalBrokerData broker1 = new LocalBrokerData();
+        broker1.setBandwidthIn(new ResourceUsage(999, 1000));
+        broker1.setBandwidthOut(new ResourceUsage(999, 1000));
+        broker1.setBundles(Sets.newHashSet("bundle-1", "bundle-2"));
+
+        BundleData bundle1 = new BundleData();
+        TimeAverageMessageData db1 = new TimeAverageMessageData();
+        db1.setMsgThroughputIn(500);
+        db1.setMsgThroughputOut(500);
+        bundle1.setShortTermData(db1);
+        loadData.getBundleData().put("bundle-1", bundle1);
+
+        BundleData bundle2 = new BundleData();
+        TimeAverageMessageData db2 = new TimeAverageMessageData();
+        db2.setMsgThroughputIn(1000);
+        db2.setMsgThroughputOut(1000);
+        bundle2.setShortTermData(db2);
+        loadData.getBundleData().put("bundle-2", bundle2);
+
+        broker1.setMsgThroughputIn((db2.getMsgThroughputIn() + db1.getMsgThroughputIn()) * 10);
+        broker1.setMsgThroughputOut((db2.getMsgThroughputOut() + db1.getMsgThroughputOut()) * 10);
+        loadData.getBrokerData().put("broker-1", new BrokerData(broker1));
+
+        Multimap<String, String> bundlesToUnload = os.findBundlesForUnloading(loadData, conf);
+        assertFalse(bundlesToUnload.isEmpty());
+        assertEquals(bundlesToUnload.get("broker-1"), Lists.newArrayList("bundle-2"));
+    }
+
+    @Test
     public void testBrokerWithMultipleBundles() {
         int numBundles = 10;
         LoadData loadData = new LoadData();

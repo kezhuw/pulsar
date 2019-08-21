@@ -23,8 +23,8 @@ import com.google.common.collect.Multimap;
 
 import java.util.Map;
 
-import org.apache.commons.lang3.mutable.MutableBoolean;
 import org.apache.commons.lang3.mutable.MutableDouble;
+import org.apache.commons.lang3.mutable.MutableInt;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.BundleData;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -89,7 +89,7 @@ public class OverloadShedder implements LoadSheddingStrategy {
                     broker, currentUsage, overloadThreshold, minimumThroughputToOffload / 1024 / 1024);
 
             MutableDouble trafficMarkedToOffload = new MutableDouble(0);
-            MutableBoolean atLeastOneBundleSelected = new MutableBoolean(false);
+            MutableInt numberOfSelectedBundles = new MutableInt(0);
 
             if (localData.getBundles().size() > 1) {
                 // Sort bundles by throughput, then pick the biggest N which combined make up for at least the minimum throughput to offload
@@ -110,11 +110,15 @@ public class OverloadShedder implements LoadSheddingStrategy {
                     return Double.compare(e2.getRight(), e1.getRight());
                 }).forEach(e -> {
                     if (trafficMarkedToOffload.doubleValue() < minimumThroughputToOffload
-                            || atLeastOneBundleSelected.isFalse()) {
-                       selectedBundlesCache.put(broker, e.getLeft());
-                       trafficMarkedToOffload.add(e.getRight());
-                       atLeastOneBundleSelected.setTrue();
-                   }
+                            || numberOfSelectedBundles.intValue() == 0) {
+                        if (numberOfSelectedBundles.intValue() == localData.getBundles().size() - 1) {
+                            // Preserves at least one bundle in broker.
+                            return;
+                        }
+                        selectedBundlesCache.put(broker, e.getLeft());
+                        trafficMarkedToOffload.add(e.getRight());
+                        numberOfSelectedBundles.increment();
+                    }
                 });
             } else if (localData.getBundles().size() == 1) {
                 log.warn(
