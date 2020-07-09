@@ -40,10 +40,10 @@ import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.stream.StreamSupport;
 
 import org.apache.bookkeeper.bookie.BookieException.InvalidCookieException;
 import org.apache.bookkeeper.bookie.storage.ldb.DbLedgerStorage;
-import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.clients.StorageClientBuilder;
 import org.apache.bookkeeper.clients.admin.StorageAdminClient;
 import org.apache.bookkeeper.clients.config.StorageClientSettings;
@@ -55,7 +55,6 @@ import org.apache.bookkeeper.common.util.Backoff;
 import org.apache.bookkeeper.common.util.Backoff.Jitter.Type;
 import org.apache.bookkeeper.conf.ServerConfiguration;
 import org.apache.bookkeeper.proto.BookieServer;
-import org.apache.bookkeeper.replication.ReplicationException;
 import org.apache.bookkeeper.server.conf.BookieConfiguration;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stream.proto.NamespaceConfiguration;
@@ -72,7 +71,10 @@ import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.server.NIOServerCnxn;
 import org.apache.zookeeper.server.NIOServerCnxnFactory;
+import org.apache.zookeeper.server.NettyServerCnxn;
+import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -203,6 +205,18 @@ public class LocalBookkeeperEnsemble {
 
         LOG.info("ZooKeeper server up: {}", b);
         LOG.debug("Local ZK started (port: {}, data_directory: {})", zkPort, zkDataDir.getAbsolutePath());
+    }
+
+    public void disconnectZookeeper(ZooKeeper zooKeeper) {
+        ServerCnxn serverCnxn = StreamSupport.stream(serverFactory.getConnections().spliterator(), false).filter((cnxn) -> {
+            assert cnxn != null;
+            return cnxn.getSessionId() == zooKeeper.getSessionId();
+        }).findFirst().orElse(null);
+        if (serverCnxn instanceof NIOServerCnxn) {
+            ((NIOServerCnxn) serverCnxn).close();
+        } else if (serverCnxn instanceof NettyServerCnxn) {
+            ((NettyServerCnxn) serverCnxn).close();
+        }
     }
 
     private void initializeZookeper() throws IOException {
@@ -409,6 +423,10 @@ public class LocalBookkeeperEnsemble {
         }
     }
 
+    public void stopBK(int i) {
+        bs[i].shutdown();
+    }
+
     public void stopBK() {
         LOG.debug("Local ZK/BK stopping ...");
         for (BookieServer bookie : bs) {
@@ -416,27 +434,30 @@ public class LocalBookkeeperEnsemble {
         }
     }
 
+    public void startBK(int i) throws Exception {
+        try {
+            bs[i] = new BookieServer(bsConfs[i], NullStatsLogger.INSTANCE);
+        } catch (InvalidCookieException e) {
+            // InvalidCookieException can happen if the machine IP has changed
+            // Since we are running here a local bookie that is always accessed
+            // from localhost, we can ignore the error
+            for (String path : zkc.getChildren("/ledgers/cookies", false)) {
+                zkc.delete("/ledgers/cookies/" + path, -1);
+            }
+
+            // Also clean the on-disk cookie
+            new File(new File(bsConfs[i].getJournalDirNames()[0], "current"), "VERSION").delete();
+
+            // Retry to start the bookie after cleaning the old left cookie
+            bs[i] = new BookieServer(bsConfs[i], NullStatsLogger.INSTANCE);
+
+        }
+        bs[i].start();
+    }
+
     public void startBK() throws Exception {
         for (int i = 0; i < numberOfBookies; i++) {
-
-            try {
-                bs[i] = new BookieServer(bsConfs[i], NullStatsLogger.INSTANCE);
-            } catch (InvalidCookieException e) {
-                // InvalidCookieException can happen if the machine IP has changed
-                // Since we are running here a local bookie that is always accessed
-                // from localhost, we can ignore the error
-                for (String path : zkc.getChildren("/ledgers/cookies", false)) {
-                    zkc.delete("/ledgers/cookies/" + path, -1);
-                }
-
-                // Also clean the on-disk cookie
-                new File(new File(bsConfs[i].getJournalDirNames()[0], "current"), "VERSION").delete();
-
-                // Retry to start the bookie after cleaning the old left cookie
-                bs[i] = new BookieServer(bsConfs[i], NullStatsLogger.INSTANCE);
-
-            }
-            bs[i].start();
+            startBK(i);
         }
     }
 

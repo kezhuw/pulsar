@@ -19,6 +19,8 @@
 package org.apache.pulsar.client.api;
 
 import static org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest.retryStrategically;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.spy;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
@@ -28,24 +30,44 @@ import com.google.common.base.Function;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
+import io.netty.buffer.ByteBuf;
+
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 import lombok.extern.slf4j.Slf4j;
 
+import org.apache.bookkeeper.bookie.Bookie;
+import org.apache.bookkeeper.client.AsyncCallback;
+import org.apache.bookkeeper.client.BookKeeper;
+import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.client.api.LedgerMetadata;
+import org.apache.bookkeeper.meta.AbstractZkLedgerManager;
+import org.apache.bookkeeper.meta.CleanupLedgerManager;
+import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
+import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
+import org.apache.bookkeeper.mledger.proto.MLDataFormats;
+import org.apache.bookkeeper.net.BookieSocketAddress;
+import org.apache.bookkeeper.proto.BookieRequestProcessor;
+import org.apache.bookkeeper.proto.BookieServer;
+import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks;
+import org.apache.bookkeeper.versioning.Version;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.loadbalance.impl.SimpleLoadManagerImpl;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.client.admin.BrokerStats;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.admin.PulsarAdminException;
@@ -56,9 +78,14 @@ import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.apache.pulsar.common.policies.data.TopicStats;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooKeeper;
+import org.powermock.reflect.Whitebox;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
+import org.testng.asserts.SoftAssert;
 
 @Slf4j
 public class ClientDeduplicationFailureTest {
@@ -413,5 +440,156 @@ public class ClientDeduplicationFailureTest {
         assertEquals(messageId.getLedgerId(), batchMessageId.getLedgerId());
         assertEquals(messageId.getEntryId(), batchMessageId.getEntryId());
         thread.interrupt();
+    }
+
+    @Test
+    public void testClientDeduplicationWithBkFailureAndZkDisconnected() throws Exception {
+        final String namespacePortion = "dedup";
+        final String replNamespace = tenant + "/" + namespacePortion;
+        final String sourceTopic = "persistent://" + replNamespace + "/my-topic1";
+        final String subscriptionName1 = "sub1";
+        final String consumerName1 = "test-consumer-1";
+        admin.namespaces().createNamespace(replNamespace);
+        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
+        admin.namespaces().setDeduplicationStatus(replNamespace, true);
+
+        // Stop one bookie, so we known that the remaining two bookies form the ensemble,
+        // write quorum and ack quorum.
+        bkEnsemble.stopBK(2);
+
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(sourceTopic)
+                .producerName("test-producer-1").create();
+
+        Consumer<String> consumer1 = pulsarClient.newConsumer(Schema.STRING)
+                .topic(sourceTopic)
+                .consumerName(consumerName1)
+                .subscriptionName(subscriptionName1)
+                .subscribe();
+
+        for (int i = 1; i <= 10; i++) {
+            producer.newMessage().sequenceId(i).value("foo-" + i).send();
+        }
+
+        BookieServer[] bookieServers = bkEnsemble.getBookies();
+        PersistentTopic topic = (PersistentTopic) pulsar.getBrokerService().getTopic(sourceTopic, false).join().get();
+        ManagedLedgerImpl managedLedger = (ManagedLedgerImpl) topic.getManagedLedger();
+        BookKeeper bookKeeper = Whitebox.getInternalState(managedLedger, "bookKeeper");
+        CleanupLedgerManager cleanupLedgerManager = (CleanupLedgerManager) bookKeeper.getLedgerManager();
+        AbstractZkLedgerManager zkLedgerManager = (AbstractZkLedgerManager) cleanupLedgerManager.getUnderlying();
+        ZooKeeper zooKeeper = Whitebox.getInternalState(zkLedgerManager, "zk");
+
+        // Disconnect zookeeper client whiling closing ledger.
+        //
+        // This will make ledger remains in open state in zookeeper.
+        AbstractZkLedgerManager spyZkLedgerManager = spy(zkLedgerManager);
+        Whitebox.setInternalState(cleanupLedgerManager, "underlying", spyZkLedgerManager);
+        doAnswer(invocation -> {
+            bkEnsemble.disconnectZookeeper(zooKeeper);
+            // Reset to original ledger manager.
+            Whitebox.setInternalState(cleanupLedgerManager, "underlying", zkLedgerManager);
+            return invocation.callRealMethod();
+        })
+            .when(spyZkLedgerManager)
+            .writeLedgerMetadata(any(long.class), any(LedgerMetadata.class), any(Version.class));
+
+        // Future that will be fulfilled after reconnect.
+        CompletableFuture<Void> reconnectedFuture = new CompletableFuture<>();
+        zooKeeper.exists("/", (WatchedEvent event) -> {
+            Watcher.Event.KeeperState state = event.getState();
+            if (state == Watcher.Event.KeeperState.SyncConnected) {
+                reconnectedFuture.complete(null);
+            }
+        });
+
+        BookieServer bookieServer1 = bookieServers[1];
+        Bookie bookie1 = bookieServer1.getBookie();
+        BookieRequestProcessor requestProcessor1 = bookieServer1.getBookieRequestProcessor();
+
+        // Spy bookie to shutdown after write request persisted to mimic bookie crash.
+        //
+        // There will be no enough ensemble for ledger to function which cause write
+        // failure and ledger closing.
+        Bookie spyBookie1 = spy(bookie1);
+        Whitebox.setInternalState(requestProcessor1, "bookie", spyBookie1);
+        doAnswer(invocation -> {
+            ByteBuf entry = invocation.getArgument(0);
+            byte[] masterKey = invocation.getArgument(4);
+            BookkeeperInternalCallbacks.WriteCallback spyCb = (int rc, long ledgerId, long entryId, BookieSocketAddress addr, Object ctx) -> {
+                ForkJoinPool.commonPool().execute(() -> {
+                    bkEnsemble.stopBK(1);
+                });
+            };
+            bookie1.addEntry(entry, false, spyCb, null, masterKey);
+            return null;
+        })
+            .when(spyBookie1)
+            .addEntry(
+                any(ByteBuf.class),
+                any(boolean.class),
+                any(BookkeeperInternalCallbacks.WriteCallback.class),
+                any(Object.class),
+                any(byte[].class)
+            );
+
+        // Spy bookkeeper to start stopped bookie to form ensemble and wait
+        // zookeeper reconnected to create new ledger.
+        BookKeeper spyBookKeeper = spy(bookKeeper);
+        Whitebox.setInternalState(managedLedger, "bookKeeper", spyBookKeeper);
+        doAnswer(invocation -> {
+            bkEnsemble.startBK(1);
+            reconnectedFuture.join();
+            Whitebox.setInternalState(managedLedger, "bookKeeper", bookKeeper);
+            return invocation.callRealMethod();
+        })
+            .when(spyBookKeeper)
+            .asyncCreateLedger(
+                any(int.class),
+                any(int.class),
+                any(int.class),
+                any(BookKeeper.DigestType.class),
+                any(byte[].class),
+                any(AsyncCallback.CreateCallback.class),
+                any(Object.class),
+                any(Map.class)
+            );
+
+        try {
+            // Due to spies above, this sending will fail in current ledger
+            // and retry then succeed in new ledger.
+            producer.newMessage().sequenceId(11).value("foo-11").send();
+        } catch (Exception ex) {
+            fail(ex.getMessage(), ex);
+        }
+
+        List<MLDataFormats.ManagedLedgerInfo.LedgerInfo> ledgerInfos = managedLedger.getLedgersInfoAsList();
+        assertEquals(ledgerInfos.size(), 2);
+
+        MLDataFormats.ManagedLedgerInfo.LedgerInfo ledgerInfo = ledgerInfos.get(0);
+        assertEquals(ledgerInfo.getEntries(), 10);
+
+        SoftAssert assertion = new SoftAssert();
+
+        // Assert that whether pulsar `LedgerInfo` and bookkeeper `LedgerMetadata` are consistent,
+        long ledgerId = ledgerInfo.getLedgerId();
+        ManagedLedgerConfig config = managedLedger.getConfig();
+        LedgerHandle handle = bookKeeper.openLedger(ledgerId, BookKeeper.DigestType.fromApiDigestType(config.getDigestType()), config.getPassword());
+        assertion.assertEquals(handle.getLedgerMetadata().getLastEntryId(), 9, "unexpected last entry id");
+        assertion.assertEquals(handle.getLastAddConfirmed(), 9, "unexpected last add confirmed");
+
+        // Add new entries so that we can safely read pass above added entries.
+        final int n = 13;
+        for (int i = 12; i <= n; i++) {
+            producer.newMessage().sequenceId(i).value("foo-" + i).send();
+        }
+
+        for (int i = 1; i <= n; i++) {
+            Message<String> msg = consumer1.receive();
+            consumer1.acknowledge(msg);
+            assertion.assertEquals(msg.getSequenceId(), i, "unexpected sequence id");
+            assertion.assertEquals(msg.getValue(), "foo-" + i, "unexpected message content");
+        }
+
+        assertion.assertAll();
     }
 }
