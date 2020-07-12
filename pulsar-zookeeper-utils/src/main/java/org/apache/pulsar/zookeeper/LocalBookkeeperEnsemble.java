@@ -32,6 +32,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
@@ -71,9 +72,7 @@ import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.server.NIOServerCnxn;
 import org.apache.zookeeper.server.NIOServerCnxnFactory;
-import org.apache.zookeeper.server.NettyServerCnxn;
 import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.slf4j.Logger;
@@ -208,15 +207,20 @@ public class LocalBookkeeperEnsemble {
     }
 
     public void disconnectZookeeper(ZooKeeper zooKeeper) {
-        ServerCnxn serverCnxn = StreamSupport.stream(serverFactory.getConnections().spliterator(), false).filter((cnxn) -> {
-            assert cnxn != null;
-            return cnxn.getSessionId() == zooKeeper.getSessionId();
-        }).findFirst().orElse(null);
-        if (serverCnxn instanceof NIOServerCnxn) {
-            ((NIOServerCnxn) serverCnxn).close();
-        } else if (serverCnxn instanceof NettyServerCnxn) {
-            ((NettyServerCnxn) serverCnxn).close();
+        ServerCnxn serverCnxn = getZookeeperServerConnection(zooKeeper);
+        try {
+            Method method = serverCnxn.getClass().getMethod("close");
+            method.invoke(serverCnxn);
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
         }
+    }
+
+    public ServerCnxn getZookeeperServerConnection(ZooKeeper zooKeeper) {
+        return StreamSupport.stream(serverFactory.getConnections().spliterator(), false)
+            .filter((cnxn) -> cnxn.getSessionId() == zooKeeper.getSessionId())
+            .findFirst()
+            .orElse(null);
     }
 
     private void initializeZookeper() throws IOException {
